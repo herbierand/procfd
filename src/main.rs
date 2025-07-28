@@ -26,6 +26,7 @@ use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Not;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -37,15 +38,18 @@ const SOCKET_TYPES: [&str; 6] = ["", "stream", "dgram", "raw", "rdm", "seqpacket
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    #[clap(short, long, display_order = 1, help = "Filter by file path")]
+    file: Option<String>,
+
     // Filter by process ID
-    #[clap(short, long, display_order = 1, help = "Filter by process ID")]
+    #[clap(short, long, display_order = 2, help = "Filter by process ID")]
     pid: Option<i32>,
 
     #[clap(
         short,
         long = "user",
         value_name = "USER",
-        display_order = 2,
+        display_order = 3,
         value_parser = validate_user,
         help = "Filter by username"
     )]
@@ -54,7 +58,7 @@ struct Args {
     #[clap(
         short,
         long,
-        display_order = 3,
+        display_order = 4,
         value_parser = validate_cmd,
         help = "Filter by exact command name. Use /cmd/ for regex match."
     )]
@@ -63,7 +67,7 @@ struct Args {
     #[clap(
         long = "type",
         value_name = "TYPE",
-        display_order = 4,
+        display_order = 5,
         help = "Filter by file descriptor type"
     )]
     type_: Option<FDType>,
@@ -71,7 +75,7 @@ struct Args {
     #[clap(
         long = "socket-domain",
         value_name = "DOMAIN",
-        display_order = 5,
+        display_order = 6,
         help = "Filter by socket domain"
     )]
     socket_domain: Option<FDSocketDomainFilter>,
@@ -79,24 +83,24 @@ struct Args {
     #[clap(
         long = "socket-type",
         value_name = "TYPE",
-        display_order = 6,
+        display_order = 7,
         help = "Filter by socket type"
     )]
     socket_type: Option<FDSocketTypeFilter>,
 
     #[clap(
         long = "socket-state",
-        display_order = 7,
+        display_order = 8,
         help = "Filter by socket state"
     )]
     socket_state: Option<String>,
 
-    #[clap(long, display_order = 8, help = "Filter by source or destination port")]
+    #[clap(long, display_order = 9, help = "Filter by source or destination port")]
     port: Option<u16>,
 
     #[clap(
         long,
-        display_order = 9,
+        display_order = 10,
         conflicts_with = "port",
         help = "Filter by source port"
     )]
@@ -104,7 +108,7 @@ struct Args {
 
     #[clap(
         long,
-        display_order = 10,
+        display_order = 11,
         conflicts_with = "port",
         help = "Filter by destination port"
     )]
@@ -112,14 +116,14 @@ struct Args {
 
     #[clap(
         long,
-        display_order = 11,
+        display_order = 12,
         help = "Filter by source or destination host/ip"
     )]
     host: Option<String>,
 
     #[clap(
         long,
-        display_order = 12,
+        display_order = 13,
         conflicts_with = "host",
         help = "Filter by source host/ip"
     )]
@@ -127,17 +131,17 @@ struct Args {
 
     #[clap(
         long,
-        display_order = 13,
+        display_order = 14,
         conflicts_with = "host",
         help = "Filter by destination host/ip"
     )]
     dst_host: Option<String>,
 
-    #[clap(long, display_order = 14, help = "Disable DNS lookups")]
+    #[clap(long, display_order = 15, help = "Disable DNS lookups")]
     no_dns: bool,
 
     // output options
-    #[clap(long, display_order = 15, help = "Render results as JSON")]
+    #[clap(long, display_order = 16, help = "Render results as JSON")]
     json: bool,
 }
 
@@ -572,6 +576,8 @@ struct FDFilter {
     socket_domain: Option<FDSocketDomainFilter>,
     socket_type: Option<FDSocketTypeFilter>,
     socket_state: Option<String>,
+    inode: Option<u64>,
+    device_id: Option<u64>,
 }
 
 fn host_or_ip_match(host_match: &str, ip_entry: &IpAddr, host_entry: &str) -> bool {
@@ -580,7 +586,7 @@ fn host_or_ip_match(host_match: &str, ip_entry: &IpAddr, host_entry: &str) -> bo
 
 // Implement file descriptor filtering logic
 impl FDFilter {
-    fn new(args: &Args) -> FDFilter {
+    fn new(args: &Args) -> Result<FDFilter> {
         let mut type_ = args.type_;
         let mut socket_domain = args.socket_domain;
         // Filtering by port implies filtering by socket
@@ -604,7 +610,15 @@ impl FDFilter {
         if args.socket_domain.is_some() {
             type_ = Some(FDType::Socket);
         }
-        FDFilter {
+        let (inode, device_id) = match &args.file {
+            Some(path) => {
+                let meta = std::fs::metadata(path)
+                    .wrap_err_with(|| format!("Failed to stat file '{}'", path))?;
+                (Some(meta.ino()), Some(meta.dev()))
+            }
+            None => (None, None),
+        };
+        Ok(FDFilter {
             port: args.port,
             src_port: args.src_port,
             dst_port: args.dst_port,
@@ -616,7 +630,9 @@ impl FDFilter {
             socket_domain,
             // socket state filtering is case insensitive
             socket_state: args.socket_state.clone().map(|s| s.to_uppercase()),
-        }
+            inode: inode,
+            device_id: device_id,
+        })
     }
 
     // True if any file descriptor filter options are set
@@ -624,6 +640,10 @@ impl FDFilter {
         // Currently only socket filter options are supported, but
         // this could be extended to other types of filters in the future
         self.type_.is_some()
+    }
+
+    fn has_ino_dev_filter(&self) -> bool {
+        self.inode.is_some() || self.device_id.is_some()
     }
 
     // True if any host or port filter options are set
@@ -652,6 +672,34 @@ impl FDFilter {
                 .is_some_and(|h| h.parse::<IpAddr>().is_err())
     }
 
+    fn match_ino_dev_on_fd(&self, pid: i32, fd: i32) -> bool {
+        if self.has_ino_dev_filter() {
+            let path = format!("/proc/{pid}/fd/{fd}");
+            return self.match_ino_dev_on_path(path.as_ref());
+        }
+        true
+    }
+
+    fn match_ino_dev_on_path(&self, path: &std::path::Path) -> bool {
+        if self.has_ino_dev_filter() {
+            let meta = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            if let Some(inode) = self.inode {
+                if inode != meta.ino() {
+                    return false;
+                }
+            }
+            if let Some(device_id) = self.device_id {
+                if device_id != meta.dev() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     // returns True if querying file descriptors is required
     // This is necessary for socket filters, but not for --type (cwd|exe|root)
     fn query_fds(&self) -> bool {
@@ -660,16 +708,21 @@ impl FDFilter {
             || self.type_ == Some(FDType::Socket)
             || self.type_ == Some(FDType::Pipe)
             || self.type_ == Some(FDType::Path)
+            || self.has_ino_dev_filter()
     }
 
     fn query_pipe(&self) -> bool {
         // query Pipe when no filters OR --type pipe
-        !self.has_filter_options() || self.type_ == Some(FDType::Pipe)
+        !self.has_filter_options()
+            || self.type_ == Some(FDType::Pipe)
+            || (self.type_.is_none() && self.has_ino_dev_filter())
     }
 
     fn query_path(&self) -> bool {
         // query Path when no filters OR --type path
-        !self.has_filter_options() || self.type_ == Some(FDType::Path)
+        !self.has_filter_options()
+            || self.type_ == Some(FDType::Path)
+            || (self.type_.is_none() && self.has_ino_dev_filter())
     }
 
     fn query_cwd(&self) -> bool {
@@ -688,7 +741,9 @@ impl FDFilter {
     }
 
     fn query_socket(&self) -> bool {
-        !self.has_filter_options() || self.type_ == Some(FDType::Socket)
+        !self.has_filter_options()
+            || self.type_ == Some(FDType::Socket)
+            || (self.type_.is_none() && self.has_ino_dev_filter())
     }
 
     fn match_socket_state(&self, state: &String) -> bool {
@@ -844,6 +899,17 @@ fn process2fdtargets(
     // Query file descriptors only if necessary (not for --exe/--root/--cwd)
     if fd_filter.query_fds() {
         for fd in &process.fds {
+            // All fd targets must pass inode/device filters
+            // For Unix sockets, also check the mapped socket path
+            let inodev_match = fd_filter.match_ino_dev_on_fd(process.pid, fd.fd)
+                || matches!(&fd.target, process::FDTarget::Socket(inode)
+                    if net_maps.unix_map.get(inode)
+                        .and_then(|e| e.path.as_ref())
+                        .map(|path| fd_filter.match_ino_dev_on_path(path.as_ref()))
+                        .unwrap_or(false));
+            if !inodev_match {
+                continue;
+            }
             let fd_target: Option<FDTarget> = match &fd.target {
                 process::FDTarget::Socket(inode) => {
                     if !fd_filter.query_socket() {
@@ -950,20 +1016,26 @@ fn process2fdtargets(
     }
     if fd_filter.query_exe() {
         if let Some(path) = &process.exe {
-            let fd_target = FDTarget::Exe(path.clone());
-            fd_targets.push(FDEntry::new(process, None, fd_target));
+            if fd_filter.match_ino_dev_on_path(path) {
+                let fd_target = FDTarget::Exe(path.clone());
+                fd_targets.push(FDEntry::new(process, None, fd_target));
+            }
         }
     }
     if fd_filter.query_cwd() {
         if let Some(path) = &process.cwd {
-            let fd_target = FDTarget::Cwd(path.clone());
-            fd_targets.push(FDEntry::new(process, None, fd_target));
+            if fd_filter.match_ino_dev_on_path(path) {
+                let fd_target = FDTarget::Cwd(path.clone());
+                fd_targets.push(FDEntry::new(process, None, fd_target));
+            }
         }
     }
     if fd_filter.query_root() {
         if let Some(path) = &process.root {
-            let fd_target = FDTarget::Root(path.clone());
-            fd_targets.push(FDEntry::new(process, None, fd_target));
+            if fd_filter.match_ino_dev_on_path(path) {
+                let fd_target = FDTarget::Root(path.clone());
+                fd_targets.push(FDEntry::new(process, None, fd_target));
+            }
         }
     }
     fd_targets
@@ -1294,7 +1366,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // query all processes and initialize filtering
-    let fd_filter = FDFilter::new(&args);
+    let fd_filter = FDFilter::new(&args)?;
 
     let all_procs = get_all_processes(&args, &fd_filter);
 
